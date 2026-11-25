@@ -71,6 +71,7 @@ def resize_with_pad_torch(
         Resized and padded tensor with same shape format as input
     """
     # Check if input is in channels-last format [*b, h, w, c] or channels-first [*b, c, h, w]
+    unbatched = images.ndim == 3
     if images.shape[-1] <= 4:  # Assume channels-last format
         channels_last = True
         # Convert to channels-first for torch operations
@@ -82,7 +83,7 @@ def resize_with_pad_torch(
         if images.dim() == 3:
             images = images.unsqueeze(0)  # Add batch dimension
 
-    batch_size, channels, cur_height, cur_width = images.shape
+    cur_height, cur_width = images.shape[-2:]
 
     # Calculate resize ratio
     ratio = max(cur_width / width, cur_height / height)
@@ -120,7 +121,7 @@ def resize_with_pad_torch(
     # Convert back to original format if needed
     if channels_last:
         padded_images = padded_images.permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
-        if batch_size == 1 and images.shape[0] == 1:
-            padded_images = padded_images.squeeze(0)  # Remove batch dimension if it was added
+    if unbatched:
+        padded_images = padded_images.squeeze(0)
 
     return padded_images

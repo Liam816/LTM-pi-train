@@ -57,7 +57,7 @@ SUITES = {
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat()
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def connect_db(path: Path, *, initialize_wal: bool = False) -> sqlite3.Connection:

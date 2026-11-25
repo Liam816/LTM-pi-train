@@ -154,6 +154,26 @@ bin/train.sh status
 checkpoint 和日志默认写入仓库下的 `checkpoints/`、`runs/`、`artifacts/`，均已被
 Git 忽略。W&B 默认离线；需要联网时在 `.env` 加 `WANDB_MODE=online`。
 
+### Python 配置和 S5000 短测
+
+`configs/train/robomme_10x_official.py` 对应原版训练参数。复制配置后可以在
+`model`、`data`、`paths`、`train` 和 `checkpoint` 字典中修改实验。
+`bin/train.sh show --cfg <配置.py>` 会打印解析后的参数。
+
+S5000 使用 `configs/train/robomme_10x_musa.py`。进入参考项目的 MUSA 环境，
+在机器本地的 `.env` 中设置 `MUSA_PYTHON`、`PI05_BASE_PARAMS` 和
+`OPENPI_DATA_HOME`。配置里的 `cuda_visible_devices` 同时控制 MUSA 可见设备和
+MCCL 进程数。四卡配置每卡每个微批 1 条样本，累积 32 个微批达到有效 batch 128。
+
+```bash
+bin/train.sh smoke --cfg configs/train/robomme_10x_musa.py
+```
+
+`smoke` 默认只更新两步，每卡每步 1 条样本，在单独的目录保存并回读 checkpoint。
+`ROBOMME_SMOKE_RESOURCE_ROOT` 可指向小规模的真实数据、配套 memory、anchor
+及 norm stats。常规训练继续读取 `paths` 中的完整数据。MUSA checkpoint 中的
+`rank-*.pt` 用于相同卡数下恢复训练，`params/` 和 `assets/` 供现有策略服务读取。
+
 ## 推理
 
 先验证训练 checkpoint 与 DreamDojo cache/encoder 是否匹配：

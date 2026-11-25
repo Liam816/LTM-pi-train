@@ -79,6 +79,21 @@ def _color_augment(image: torch.Tensor) -> torch.Tensor:
     return torch.clamp(gray + (image - gray) * saturation_factor, 0, 1)
 
 
+def _preprocess_anchor(anchor, image_resolution, train):
+    if anchor is None:
+        return None
+    if anchor.dtype == torch.uint8:
+        anchor = anchor.to(dtype=torch.float32).mul_(2.0 / 255.0).add_(-1.0)
+    if anchor.shape[1] == 3:
+        anchor = anchor.permute(0, 2, 3, 1)
+    if anchor.shape[1:3] != image_resolution:
+        anchor = image_tools.resize_with_pad_torch(anchor, *image_resolution)
+    if train:
+        anchor = _random_crop_and_rotate(anchor / 2.0 + 0.5)
+        anchor = _color_augment(anchor) * 2.0 - 1.0
+    return anchor.permute(0, 3, 1, 2)
+
+
 def preprocess_observation_pytorch(
     observation,
     *,
@@ -137,20 +152,6 @@ def preprocess_observation_pytorch(
 
         out_images[key] = image
 
-    memory_demo_start_image = observation.memory_demo_start_image
-    if memory_demo_start_image is not None:
-        anchor = memory_demo_start_image
-        if anchor.dtype == torch.uint8:
-            anchor = anchor.to(dtype=torch.float32).mul_(2.0 / 255.0).add_(-1.0)
-        if anchor.shape[1] == 3:
-            anchor = anchor.permute(0, 2, 3, 1)
-        if anchor.shape[1:3] != image_resolution:
-            anchor = image_tools.resize_with_pad_torch(anchor, *image_resolution)
-        if train:
-            anchor = _random_crop_and_rotate(anchor / 2.0 + 0.5)
-            anchor = _color_augment(anchor) * 2.0 - 1.0
-        memory_demo_start_image = anchor.permute(0, 3, 1, 2)
-
     # obtain mask
     out_masks = {}
     for key in out_images:
@@ -169,7 +170,11 @@ def preprocess_observation_pytorch(
         memory_latents=observation.memory_latents,
         memory_mask=observation.memory_mask,
         memory_segment_ids=observation.memory_segment_ids,
-        memory_demo_start_image=memory_demo_start_image,
+        memory_demo_start_image=_preprocess_anchor(observation.memory_demo_start_image, image_resolution, train),
+        memory_execution_start_image=_preprocess_anchor(
+            getattr(observation, "memory_execution_start_image", None), image_resolution, train
+        ),
+        memory_execution_start_mask=getattr(observation, "memory_execution_start_mask", None),
         memory_demo_start_mask=observation.memory_demo_start_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
