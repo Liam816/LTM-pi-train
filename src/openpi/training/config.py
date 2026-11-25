@@ -101,6 +101,7 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    lowercase_task_prompts: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -658,6 +659,8 @@ class TrainConfig:
     # Number of batches loaded in advance by each data loader worker. This is
     # only used when num_workers is greater than zero.
     prefetch_factor: int = 2
+    # Allow the PyTorch loader to allocate page-locked host buffers for accelerator transfers.
+    pin_memory: bool = True
     # Preserve the sampler's exact batch order when using multiprocessing.
     # Disabling this avoids head-of-line blocking when one worker finishes a
     # much heavier memory batch later than workers producing subsequent batches.
@@ -757,6 +760,8 @@ class TrainConfig:
             raise ValueError("memory_pad_to_multiple must be positive")
         if type(self.prefetch_factor) is not int or self.prefetch_factor <= 0:
             raise ValueError("prefetch_factor must be a positive integer")
+        if type(self.pin_memory) is not bool:
+            raise ValueError("pin_memory must be a boolean")
         if type(self.data_loader_in_order) is not bool:
             raise ValueError("data_loader_in_order must be a boolean")
         if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps <= 0:
@@ -3515,6 +3520,55 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+def _robomme_1x_dreamdojo_config(base: TrainConfig) -> TrainConfig:
+    """Original-data setting from LTM Table 1, using the released DreamDojo model."""
+    root = pathlib.Path(os.environ.get("ROBOMME_1X_RESOURCE_ROOT", "external/robomme_1x"))
+    return dataclasses.replace(
+        base,
+        name="pi05_robomme_1x_dreamdojo_fixedlag5_h50",
+        model=dataclasses.replace(base.model, memory_horizon=1410),
+        data=dataclasses.replace(
+            base.data,
+            repo_id=str(root / "datasets/video"),
+            assets=dataclasses.replace(
+                base.data.assets, assets_dir=str(root / "assets"), asset_id="lerobot/robomme"
+            ),
+            base_config=dataclasses.replace(
+                base.data.base_config,
+                memory_cache_dir=str(root / "artifacts/memory"),
+                demo_anchor_cache_dir=str(root / "artifacts/anchors"),
+                lowercase_task_prompts=True,
+                memory_random_drop_execution_tail_min=5,
+                memory_random_drop_execution_tail_max=5,
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
+        batch_size=128,
+        fsdp_devices=8,
+        prefetch_factor=2,
+        data_loader_in_order=False,
+        memory_bucket_size_multiplier=50,
+        memory_pad_to_multiple=512,
+        seed=0,
+        num_train_steps=40_000,
+        save_steps=(10_000, 20_000, 30_000, 40_000),
+        keep_period=None,
+        policy_metadata={
+            **base.policy_metadata,
+            "task": "RoboMME_original_16_tasks_x_100_episodes",
+            "memory_random_drop_execution_tail": "fixed_integer_5_per_sample",
+        },
+    )
+
+
+_CONFIGS.append(
+    _robomme_1x_dreamdojo_config(
+        next(c for c in _CONFIGS if c.name == "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default")
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

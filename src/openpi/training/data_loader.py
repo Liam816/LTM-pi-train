@@ -1415,7 +1415,10 @@ def create_torch_dataset(
         dataset = HoldLastActionTargetsDataset(dataset, data_config.action_sequence_keys)
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        prompts = dataset_meta.tasks
+        if data_config.lowercase_task_prompts:
+            prompts = {idx: text.lower() for idx, text in prompts.items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
 
     return dataset
 
@@ -1540,6 +1543,7 @@ def create_data_loader(
         num_batches=num_batches,
         num_workers=config.num_workers,
         prefetch_factor=config.prefetch_factor,
+        pin_memory=config.pin_memory,
         in_order=config.data_loader_in_order,
         memory_bucket_size_multiplier=config.memory_bucket_size_multiplier,
         memory_pad_to_multiple=config.memory_pad_to_multiple,
@@ -1562,6 +1566,7 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     prefetch_factor: int = 2,
+    pin_memory: bool = True,
     in_order: bool = True,
     memory_bucket_size_multiplier: int = 50,
     memory_pad_to_multiple: int = 32,
@@ -1842,6 +1847,7 @@ def create_torch_data_loader(
         num_batches=num_batches,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
         in_order=in_order,
         memory_pad_to_multiple=memory_pad_to_multiple,
         memory_max_length=model_config.memory_horizon if use_lam_memory else None,
@@ -1910,6 +1916,7 @@ class TorchDataLoader:
         num_batches: int | None = None,
         num_workers: int = 0,
         prefetch_factor: int = 2,
+        pin_memory: bool = True,
         in_order: bool = True,
         memory_pad_to_multiple: int = 1,
         memory_max_length: int | None = None,
@@ -2005,7 +2012,7 @@ class TorchDataLoader:
             "collate_fn": batch_collate_fn,
             "worker_init_fn": functools.partial(_worker_init_fn, direct_exit=framework == "jax"),
             "generator": generator,
-            "pin_memory": framework == "pytorch" and torch.cuda.is_available() and torch.cuda.device_count() > 0,
+            "pin_memory": pin_memory and framework == "pytorch" and torch.cuda.is_available() and torch.cuda.device_count() > 0,
         }
         if num_workers > 0:
             common_loader_kwargs["prefetch_factor"] = prefetch_factor

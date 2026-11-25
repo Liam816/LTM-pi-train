@@ -33,6 +33,7 @@ readonly WORKERS_PER_GPU="${ROBOMME_EVAL_WORKERS_PER_GPU:-12}"
 readonly BASE_PORT="${ROBOMME_EVAL_BASE_PORT:-8200}"
 readonly RESULTS_ROOT="${ROBOMME_EVAL_RESULTS_ROOT:-${BUNDLE_ROOT}/evaluations}"
 readonly RESULTS_DIR="${RESULTS_ROOT}/${RUN_NAME}"
+readonly MODEL_SEED="${ROBOMME_EVAL_MODEL_SEED:-42}"
 readonly MAX_ATTEMPTS="${ROBOMME_EVAL_MAX_ATTEMPTS:-3}"
 readonly MAX_GPU_USED_MIB="${ROBOMME_EVAL_MAX_GPU_USED_MIB:-1024}"
 readonly SESSION_DEFAULT="robomme-eval-$(printf '%s' "${RUN_NAME}" | tr -cs '[:alnum:]_.-' '-')"
@@ -96,6 +97,7 @@ validate_settings() {
   (( BASE_PORT + ${#GPU_IDS[@]} - 1 <= 65535 )) || die "evaluation port range exceeds 65535"
   is_positive_integer "${MAX_ATTEMPTS}" || die "ROBOMME_EVAL_MAX_ATTEMPTS must be positive"
   [[ ${MAX_GPU_USED_MIB} =~ ^[0-9]+$ ]] || die "ROBOMME_EVAL_MAX_GPU_USED_MIB must be non-negative"
+  [[ ${MODEL_SEED} =~ ^[0-9]+$ ]] || die "ROBOMME_EVAL_MODEL_SEED must be a non-negative integer"
   validate_gpu_list
 }
 
@@ -203,7 +205,7 @@ start_servers() {
     gpu=${GPU_IDS[slot]}
     port=$((BASE_PORT + slot))
     log="${RESULTS_DIR}/logs/server_gpu${gpu}.log"
-    command="cd '${BUNDLE_ROOT}' && export CUDA_VISIBLE_DEVICES='${gpu}' XLA_PYTHON_CLIENT_PREALLOCATE=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1; exec '${BUNDLE_ROOT}/bin/serve.sh' --checkpoint '${CHECKPOINT}' --device cuda:0 --host 0.0.0.0 --port '${port}' --num-inference-steps 10 --pair-batch-size 4 >>'${log}' 2>&1"
+    command="cd '${BUNDLE_ROOT}' && export ROBOMME_ENV_FILE='${ENV_FILE}' CUDA_VISIBLE_DEVICES='${gpu}' XLA_PYTHON_CLIENT_PREALLOCATE=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1; exec '${BUNDLE_ROOT}/bin/serve.sh' --checkpoint '${CHECKPOINT}' --device cuda:0 --host 0.0.0.0 --port '${port}' --num-inference-steps 10 --pair-batch-size 4 >>'${log}' 2>&1"
     tmux new-window -d -t "${SESSION}" -n "server${gpu}" "${command}"
   done
 }
@@ -223,7 +225,7 @@ run_smoke_rollout() {
   mkdir -p "${SMOKE_DIR}/logs"
   eval_python init --db "${SMOKE_DB}" --run-name "${RUN_NAME}-smoke" --max-attempts 1
   vulkan_exports=$(optional_vulkan_exports)
-  command="cd '${BENCHMARK_ROOT}' && unset LIBGL_ALWAYS_SOFTWARE; export PYTHONPATH='${PYTHONPATH_VALUE}' PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='${gpu}' SAPIEN_RENDER_DEVICE=cuda:0 ROBOMME_RENDER_BACKEND=cuda:0 PYTHONUNBUFFERED=1;${vulkan_exports} exec '${EVAL_PY}' '${EVAL_SCRIPT}' worker --db '${SMOKE_DB}' --results-dir '${SMOKE_DIR}' --worker-id smoke --gpu-id '${gpu}' --server-host 127.0.0.1 --server-port '${port}' --max-steps 1300 --replan-steps 10 --model-seed 42 --max-attempts 1 --stale-seconds 1800 --save-video failures --video-stride 2 >>'${SMOKE_DIR}/logs/worker_smoke.log' 2>&1"
+  command="cd '${BENCHMARK_ROOT}' && unset LIBGL_ALWAYS_SOFTWARE; export PYTHONPATH='${PYTHONPATH_VALUE}' PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='${gpu}' SAPIEN_RENDER_DEVICE=cuda:0 ROBOMME_RENDER_BACKEND=cuda:0 PYTHONUNBUFFERED=1;${vulkan_exports} exec '${EVAL_PY}' '${EVAL_SCRIPT}' worker --db '${SMOKE_DB}' --results-dir '${SMOKE_DIR}' --worker-id smoke --gpu-id '${gpu}' --server-host 127.0.0.1 --server-port '${port}' --max-steps 1300 --replan-steps 10 --model-seed '${MODEL_SEED}' --max-attempts 1 --stale-seconds 1800 --save-video failures --video-stride 2 >>'${SMOKE_DIR}/logs/worker_smoke.log' 2>&1"
   tmux new-window -d -t "${SESSION}" -n smoke "${command}"
   wait_for_one_terminal_job
   errors=$(db_scalar "${SMOKE_DB}" "SELECT COUNT(*) FROM jobs WHERE status='error'")
@@ -243,7 +245,7 @@ start_workers_monitor_and_finalizer() {
     for ((worker_slot=0; worker_slot<WORKERS_PER_GPU; worker_slot++)); do
       worker_id="g${gpu}w${worker_slot}"
       log="${RESULTS_DIR}/logs/worker_${worker_id}.log"
-      command="cd '${BENCHMARK_ROOT}' && unset LIBGL_ALWAYS_SOFTWARE; export PYTHONPATH='${PYTHONPATH_VALUE}' PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='${gpu}' SAPIEN_RENDER_DEVICE=cuda:0 ROBOMME_RENDER_BACKEND=cuda:0 PYTHONUNBUFFERED=1;${vulkan_exports} while true; do '${EVAL_PY}' '${EVAL_SCRIPT}' worker --db '${DB}' --results-dir '${RESULTS_DIR}' --worker-id '${worker_id}' --gpu-id '${gpu}' --server-host 127.0.0.1 --server-port '${port}' --max-steps 1300 --replan-steps 10 --model-seed 42 --max-attempts '${MAX_ATTEMPTS}' --stale-seconds 1800 --save-video failures --video-stride 2 >>'${log}' 2>&1; rc=\$?; (( rc == 0 )) && break; printf 'worker_exit=%s\\n' \"\$rc\" >>'${log}'; sleep 10; done"
+      command="cd '${BENCHMARK_ROOT}' && unset LIBGL_ALWAYS_SOFTWARE; export PYTHONPATH='${PYTHONPATH_VALUE}' PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='${gpu}' SAPIEN_RENDER_DEVICE=cuda:0 ROBOMME_RENDER_BACKEND=cuda:0 PYTHONUNBUFFERED=1;${vulkan_exports} while true; do '${EVAL_PY}' '${EVAL_SCRIPT}' worker --db '${DB}' --results-dir '${RESULTS_DIR}' --worker-id '${worker_id}' --gpu-id '${gpu}' --server-host 127.0.0.1 --server-port '${port}' --max-steps 1300 --replan-steps 10 --model-seed '${MODEL_SEED}' --max-attempts '${MAX_ATTEMPTS}' --stale-seconds 1800 --save-video failures --video-stride 2 >>'${log}' 2>&1; rc=\$?; (( rc == 0 )) && break; printf 'worker_exit=%s\\n' \"\$rc\" >>'${log}'; sleep 10; done"
       tmux new-window -d -t "${SESSION}" -n "${worker_id}" "${command}"
       sleep 1
     done
@@ -252,7 +254,7 @@ start_workers_monitor_and_finalizer() {
   command="cd '${BENCHMARK_ROOT}' && export PYTHONPATH='${PYTHONPATH_VALUE}' PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1; exec '${EVAL_PY}' '${EVAL_SCRIPT}' monitor --db '${DB}' --results-dir '${RESULTS_DIR}' --run-name '${RUN_NAME}' --interval 15 --no-wandb >>'${RESULTS_DIR}/logs/summary.log' 2>&1"
   tmux new-window -d -t "${SESSION}" -n summary "${command}"
 
-  command="export ROBOMME_ENV_FILE='${ENV_FILE}' ROBOMME_EVAL_CHECKPOINT='${CHECKPOINT}' ROBOMME_BENCHMARK_ROOT='${BENCHMARK_ROOT}' ROBOMME_EVAL_PYTHON='${EVAL_PY}' ROBOMME_EVAL_NAME='${RUN_NAME}' ROBOMME_EVAL_GPUS='${GPU_CSV}' ROBOMME_EVAL_WORKERS_PER_GPU='${WORKERS_PER_GPU}' ROBOMME_EVAL_BASE_PORT='${BASE_PORT}' ROBOMME_EVAL_RESULTS_ROOT='${RESULTS_ROOT}' ROBOMME_EVAL_MAX_ATTEMPTS='${MAX_ATTEMPTS}' ROBOMME_EVAL_MAX_GPU_USED_MIB='${MAX_GPU_USED_MIB}' ROBOMME_EVAL_SESSION='${SESSION}'; exec '${SELF}' finalize >>'${RESULTS_DIR}/logs/finalizer.log' 2>&1"
+  command="export ROBOMME_ENV_FILE='${ENV_FILE}' ROBOMME_EVAL_CHECKPOINT='${CHECKPOINT}' ROBOMME_BENCHMARK_ROOT='${BENCHMARK_ROOT}' ROBOMME_EVAL_PYTHON='${EVAL_PY}' ROBOMME_EVAL_NAME='${RUN_NAME}' ROBOMME_EVAL_GPUS='${GPU_CSV}' ROBOMME_EVAL_WORKERS_PER_GPU='${WORKERS_PER_GPU}' ROBOMME_EVAL_BASE_PORT='${BASE_PORT}' ROBOMME_EVAL_RESULTS_ROOT='${RESULTS_ROOT}' ROBOMME_EVAL_MAX_ATTEMPTS='${MAX_ATTEMPTS}' ROBOMME_EVAL_MAX_GPU_USED_MIB='${MAX_GPU_USED_MIB}' ROBOMME_EVAL_SESSION='${SESSION}' ROBOMME_EVAL_MODEL_SEED='${MODEL_SEED}'; exec '${SELF}' finalize >>'${RESULTS_DIR}/logs/finalizer.log' 2>&1"
   tmux new-window -d -t "${SESSION}" -n finalizer "${command}"
   tmux select-window -t "${SESSION}:summary"
 }
@@ -284,7 +286,7 @@ launch() {
   mkdir -p "${RESULTS_DIR}/logs"
   local command vulkan_exports
   vulkan_exports=$(optional_vulkan_exports)
-  command="export ROBOMME_ENV_FILE='${ENV_FILE}' ROBOMME_EVAL_CHECKPOINT='${CHECKPOINT}' ROBOMME_BENCHMARK_ROOT='${BENCHMARK_ROOT}' ROBOMME_EVAL_PYTHON='${EVAL_PY}' ROBOMME_EVAL_NAME='${RUN_NAME}' ROBOMME_EVAL_GPUS='${GPU_CSV}' ROBOMME_EVAL_WORKERS_PER_GPU='${WORKERS_PER_GPU}' ROBOMME_EVAL_BASE_PORT='${BASE_PORT}' ROBOMME_EVAL_RESULTS_ROOT='${RESULTS_ROOT}' ROBOMME_EVAL_MAX_ATTEMPTS='${MAX_ATTEMPTS}' ROBOMME_EVAL_MAX_GPU_USED_MIB='${MAX_GPU_USED_MIB}' ROBOMME_EVAL_SESSION='${SESSION}';${vulkan_exports} exec '${SELF}' run"
+  command="export ROBOMME_ENV_FILE='${ENV_FILE}' ROBOMME_EVAL_CHECKPOINT='${CHECKPOINT}' ROBOMME_BENCHMARK_ROOT='${BENCHMARK_ROOT}' ROBOMME_EVAL_PYTHON='${EVAL_PY}' ROBOMME_EVAL_NAME='${RUN_NAME}' ROBOMME_EVAL_GPUS='${GPU_CSV}' ROBOMME_EVAL_WORKERS_PER_GPU='${WORKERS_PER_GPU}' ROBOMME_EVAL_BASE_PORT='${BASE_PORT}' ROBOMME_EVAL_RESULTS_ROOT='${RESULTS_ROOT}' ROBOMME_EVAL_MAX_ATTEMPTS='${MAX_ATTEMPTS}' ROBOMME_EVAL_MAX_GPU_USED_MIB='${MAX_GPU_USED_MIB}' ROBOMME_EVAL_SESSION='${SESSION}' ROBOMME_EVAL_MODEL_SEED='${MODEL_SEED}';${vulkan_exports} exec '${SELF}' run"
   tmux new-session -d -s "${SESSION}" -n bootstrap "${command}"
   tmux set-option -t "${SESSION}" remain-on-exit on
   tmux set-option -t "${SESSION}" history-limit 100000

@@ -1,5 +1,6 @@
 """MUSA worker for the Python CFG launcher. Each process owns one logical S5000."""
 
+from contextlib import nullcontext
 import dataclasses
 import fcntl
 import json
@@ -20,7 +21,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecis
 from torch.distributed.fsdp.wrap import CustomPolicy
 
 from openpi.models.model import restore_params
-from openpi.models_pytorch.ltm_pi import JointBlock, LTMPolicy
+from openpi.models_pytorch.ltm_pi import JointBlock, LTMPolicy, prepare_flow_inputs
 from openpi.models_pytorch.ltm_weights import export_inference, load_base
 from openpi.training import data_loader
 from train_cfg import _build_train_config
@@ -90,6 +91,7 @@ def save_step(root, step_id, completed, rank, world, params, ema, optimizer, cfg
                     preset=cfg.name,
                     batch_size=cfg.batch_size,
                     accumulation=cfg.gradient_accumulation_steps,
+                    sample_effective_batch=plan.get("sample_effective_batch", False),
                     model=plan["model"],
                     data=plan["data"],
                     paths=plan["paths"],
@@ -120,6 +122,8 @@ def restore_step(path, rank, world, params, ema, optimizer, cfg, plan):
     ) != (1, world, cfg.name, cfg.batch_size, cfg.gradient_accumulation_steps, plan["model"], plan["data"]):
         raise ValueError("Checkpoint architecture, training batch, data options, or MUSA shard count differ")
     state = torch.load(path / f"rank-{rank}.pt", map_location="cpu", weights_only=False)
+    if meta.get("sample_effective_batch", False) != plan.get("sample_effective_batch", False):
+        raise ValueError("Checkpoint and current run use different sampling batch sizes")
     if params.keys() != state["params"].keys() or (ema is None) != (state["ema"] is None):
         raise ValueError("Checkpoint parameters or EMA configuration differ")
     for name, param in params.items():
@@ -137,9 +141,39 @@ def restore_step(path, rank, world, params, ema, optimizer, cfg, plan):
     return meta["step"]
 
 
+def microbatches(loader, consumed, local_size, device, image_keys, measure):
+    """Split an optimizer batch after its sample selection, augmentation and flow RNG draws."""
+    loader.set_epoch(consumed // len(loader), batch_offset=consumed % len(loader))
+    stream = iter(loader)
+    while True:
+        tick = time.perf_counter() if measure else 0.0
+        obs, actions = next(stream)
+        read_seconds = time.perf_counter() - tick if measure else 0.0
+        host_mask = obs.memory_mask
+        obs = jax.tree.map(lambda t: t.to(device, non_blocking=True), obs)
+        actions = actions.to(device, dtype=torch.float32, non_blocking=True)
+        if len(actions) == local_size:
+            yield (obs, actions, None), host_mask, read_seconds
+        else:
+            # Image jitter is batch-shared. Drawing it (and flow time/noise) once
+            # keeps the same training examples and targets as an unsplit forward.
+            obs, flow = prepare_flow_inputs(obs, actions, image_keys, train=True)
+            for begin in range(0, len(actions), local_size):
+                end = begin + local_size
+                values = jax.tree.map(lambda t: t[begin:end], (obs, actions, flow))
+                yield values, host_mask[begin:end], read_seconds if begin == 0 else 0.0
+        consumed += 1
+        if consumed % len(loader) == 0:
+            loader.set_epoch(consumed // len(loader))
+            stream = iter(loader)
+
+
 def train(plan, rank, world, device):
     cfg = _build_train_config(plan)
     smoke = plan["smoke"]
+    bench = plan.get("benchmark")
+    if bench and (smoke or cfg.resume or cfg.restore_checkpoint_dir or not 1 <= cfg.num_train_steps <= 24):
+        raise ValueError("Throughput benchmarking requires a fresh run of 1 to 24 complete updates")
     if smoke and not 1 <= cfg.num_train_steps <= 5:
         raise ValueError("MUSA smoke must be limited to at most five updates")
     if cfg.batch_size % (world * cfg.gradient_accumulation_steps):
@@ -166,7 +200,8 @@ def train(plan, rank, world, device):
     elif cfg.restore_checkpoint_dir:
         source = Path(cfg.restore_checkpoint_dir) / str(cfg.restore_checkpoint_step)
     torch.manual_seed(cfg.seed)
-    model = LTMPolicy(cfg.model, activation_checkpointing=plan["activation_checkpointing"])
+    model = LTMPolicy(cfg.model, activation_checkpointing=plan["activation_checkpointing"],
+                      activation_checkpoint_blocks=plan.get("activation_checkpoint_blocks"))
     shapes = {name: p.shape for name, p in model.named_parameters()}
     if source is None and rank == 0:
         load_base(model, plan["paths"]["base_params_dir"], cfg.seed)
@@ -205,17 +240,22 @@ def train(plan, rank, world, device):
     )
     ema = None if cfg.ema_decay is None else {k: p.detach().clone() for k, p in params.items()}
     physical_batch = cfg.batch_size // cfg.gradient_accumulation_steps
+    grouped = plan.get("sample_effective_batch", False)
+    loader_batch = cfg.batch_size if grouped else physical_batch
     loader = data_loader.create_data_loader(
-        dataclasses.replace(cfg, batch_size=physical_batch), shuffle=True, framework="pytorch"
+        dataclasses.replace(cfg, batch_size=loader_batch), shuffle=True, framework="pytorch"
     )
     torch.manual_seed(cfg.seed + rank)
     torch.musa.manual_seed(cfg.seed + rank)
     np.random.seed(cfg.seed + rank)
     random.seed(cfg.seed + rank)
     start = 0 if source is None else restore_step(source, rank, world, params, ema, optimizer, cfg, plan)
-    batches = start * cfg.gradient_accumulation_steps
-    loader.set_epoch(batches // len(loader), batch_offset=batches % len(loader))
-    stream = iter(loader)
+    consumed = start * (cfg.batch_size // loader_batch)
+    if bench:
+        consumed += bench["batch_offset"]
+    if bench and bench["batch_offset"] >= len(loader):
+        raise ValueError("benchmark batch offset is outside epoch zero")
+    stream = microbatches(loader, consumed, physical_batch // world, device, cfg.model.active_image_keys, bool(bench))
     schedule = cfg.lr_schedule.create()
     wandb_run = None
     if rank == 0:
@@ -242,23 +282,32 @@ def train(plan, rank, world, device):
     events = []
     try:
         for index in range(start, cfg.num_train_steps):
+            if bench:
+                torch.musa.synchronize(device)
+                barrier()
+                torch.musa.reset_peak_memory_stats(device)
+                tick = time.perf_counter()
+                local_tokens = local_max = local_pad = local_seen = 0
+                load_seconds = 0.0
             lr = float(schedule(index))
             optimizer.param_groups[0]["lr"] = lr
             optimizer.param_groups[1]["lr"] = lr * cfg.memory_projector_lr_multiplier
             optimizer.zero_grad(set_to_none=True)
             loss_sum = torch.zeros((), device=device)
-            for _ in range(cfg.gradient_accumulation_steps):
-                if batches and batches % len(loader) == 0:
-                    loader.set_epoch(batches // len(loader))
-                    stream = iter(loader)
-                observation, actions = next(stream)
-
-                observation = jax.tree.map(lambda t: t.to(device, non_blocking=True), observation)
-                actions = actions.to(device, dtype=torch.float32, non_blocking=True)
-                loss = model(observation, actions) / cfg.gradient_accumulation_steps
-                loss.backward()
+            for micro in range(cfg.gradient_accumulation_steps):
+                model_args, host_mask, read_seconds = next(stream)
+                if bench:
+                    load_seconds += read_seconds
+                    lengths = host_mask.sum(1)
+                    local_tokens += int(lengths.sum())
+                    local_max = max(local_max, int(lengths.max()))
+                    local_pad = max(local_pad, host_mask.shape[1])
+                    local_seen += host_mask.shape[0]
+                defer = plan.get("defer_gradient_sync", False) and world > 1 and micro + 1 < cfg.gradient_accumulation_steps
+                with model.no_sync() if defer else nullcontext():
+                    loss = model(*model_args) / cfg.gradient_accumulation_steps
+                    loss.backward()
                 loss_sum += loss.detach()
-                batches += 1
             norm = (
                 model.clip_grad_norm_(opt.clip_gradient_norm)
                 if world > 1
@@ -283,6 +332,21 @@ def train(plan, rank, world, device):
                     for k, p in params.items():
                         ema[k].lerp_(p.detach(), 1 - cfg.ema_decay)
             metric = dict(step=index + 1, loss=avg_loss.item(), grad_norm=norm.item(), lr=lr)
+            if bench:
+                torch.musa.synchronize(device)
+                seconds = time.perf_counter() - tick
+                maximum = torch.tensor([seconds, load_seconds, torch.musa.max_memory_allocated(device) / 2**30,
+                                        torch.musa.max_memory_reserved(device) / 2**30, local_max, local_pad],
+                                       device=device, dtype=torch.float32)
+                totals = torch.tensor([local_tokens, local_seen], device=device, dtype=torch.int64)
+                if world > 1:
+                    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+                t, read, allocated, reserved, max_len, padded = maximum.tolist()
+                token_count, samples = global_sum(totals).tolist()
+                if samples != cfg.batch_size:
+                    raise ValueError(f"Expected {cfg.batch_size} samples in update, got {samples}")
+                metric.update(seconds=t, samples=samples, loader_s=read, allocated_gib=allocated, reserved_gib=reserved,
+                              mean_history=token_count / samples, max_history=int(max_len), padded=int(padded))
             if smoke:
                 changes = [
                     global_sum((p.detach() - b).float().abs().sum()).item() for p, b in zip(probes, before, strict=True)
@@ -295,8 +359,8 @@ def train(plan, rank, world, device):
                 metric.update(
                     memory_grad_norm=memory_norm,
                     verified_parameter_delta_l1=changes,
-                    valid_history_tokens=observation.memory_mask.sum().item(),
-                    action_shape=list(actions.shape),
+                    valid_history_tokens=host_mask.sum().item(),
+                    action_shape=list(model_args[1].shape),
                 )
                 events.append(metric)
             if rank == 0 and (index % cfg.log_interval == 0 or index + 1 == cfg.num_train_steps):
@@ -309,7 +373,7 @@ def train(plan, rank, world, device):
                 if cfg.save_steps
                 else ((index > start and index % cfg.save_interval == 0) or index + 1 == cfg.num_train_steps)
             )
-            if save:
+            if save and not bench:
                 target = save_step(root, step_id, index + 1, rank, world, params, ema, optimizer, cfg, plan, shapes)
                 if smoke and index + 1 == cfg.num_train_steps:
                     restored = restore_step(target, rank, world, params, ema, optimizer, cfg, plan)

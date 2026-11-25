@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the fixed-lag-10 RoboMME policy and its DreamDojo visual encoder.
+"""Serve a fixed-lag RoboMME policy and its DreamDojo visual encoder.
 
 Each websocket connection owns an independent causal memory history.  The
 shared JAX policy and DreamDojo encoder are serialized on one GPU so several
@@ -33,6 +33,8 @@ for _path in (str(_RUNTIME_ROOT), str(_RUNTIME_ROOT / "src")):
 
 
 DEFAULT_CONFIG = "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default"
+ORIGINAL_CONFIG = "pi05_robomme_1x_dreamdojo_fixedlag5_h50"
+COMPATIBLE_CONFIGS = {DEFAULT_CONFIG, ORIGINAL_CONFIG}
 DEFAULT_DREAMDOJO_RUNTIME_ROOT = _RUNTIME_ROOT / "third_party" / "dreamdojo" / "runtime"
 EXPECTED_ENCODER_SHA256 = "d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f"
 EXPECTED_CHECKPOINT_FORMAT = "dreamdojo.lightning"
@@ -50,7 +52,7 @@ EXPECTED_ALIGNMENT = "row_0_invalid_zero; row_i=z_mu(frame_i-1,frame_i), i>=1"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--config", help="Training preset. MUSA checkpoints record their preset in musa.json.")
     parser.add_argument(
         "--memory-manifest",
         type=Path,
@@ -81,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-lag",
         type=int,
-        default=10,
-        help="Hide this many newest execution LAM tokens at inference; must match fixed-lag training.",
+        default=None,
+        help="Override the inference lag. When set, it must match the training preset.",
     )
     parser.add_argument("--pair-batch-size", type=int, default=16)
     parser.add_argument(
@@ -131,7 +133,7 @@ def _load_manifest(path: Path, latent_dim: int) -> tuple[dict[str, Any], np.ndar
     }
     mismatches = {key: (manifest.get(key), value) for key, value in expected.items() if manifest.get(key) != value}
     if mismatches:
-        raise ValueError(f"Memory manifest is not the fixed-lag-10 training manifest: {mismatches}")
+        raise ValueError(f"Memory manifest is incompatible with the DreamDojo runtime: {mismatches}")
     manifest_encoder = (
         str(manifest.get("checkpoint_format", "")),
         str(manifest.get("checkpoint_sha256", "")),
@@ -143,8 +145,12 @@ def _load_manifest(path: Path, latent_dim: int) -> tuple[dict[str, Any], np.ndar
 
 def _checkpoint_is_committed(path: Path) -> None:
     path = path.expanduser().resolve()
+    # MUSA commits the directory by rename after exporting its Orbax parameter tree.
+    if path.name.startswith((".saving-", ".interrupted-")):
+        raise ValueError(f"Checkpoint has not been committed: {path}")
+    commit_file = (path / "params" if (path / "musa.json").is_file() else path) / "_CHECKPOINT_METADATA"
     required = (
-        path / "_CHECKPOINT_METADATA",
+        commit_file,
         path / "params" / "_METADATA",
         path / "params" / "manifest.ocdbt",
     )
@@ -154,7 +160,7 @@ def _checkpoint_is_committed(path: Path) -> None:
         raise FileNotFoundError(
             f"Checkpoint is incomplete: missing={missing}, norm_stats={[str(item) for item in norm_stats]}"
         )
-    metadata = json.loads((path / "_CHECKPOINT_METADATA").read_text())
+    metadata = json.loads(commit_file.read_text())
     if not int(metadata.get("commit_timestamp_nsecs", 0)):
         raise ValueError(f"Checkpoint has no Orbax commit timestamp: {path}")
 
@@ -182,6 +188,7 @@ class MemorySession:
         two_view_memory: bool,
         memory_lag: int,
         latent_storage_dtype: str,
+        lowercase_task_prompts: bool = False,
     ) -> None:
         self.policy = policy
         self.dreamdojo_model = dreamdojo_model
@@ -202,6 +209,7 @@ class MemorySession:
         self.two_view_memory = two_view_memory
         self.memory_lag = memory_lag
         self.latent_storage_dtype = latent_storage_dtype
+        self.lowercase_task_prompts = lowercase_task_prompts
         self.reset(0)
 
     def reset(self, seed: int) -> dict[str, Any]:
@@ -387,6 +395,8 @@ class MemorySession:
         prompt = message.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("infer requires a non-empty string prompt")
+        if self.lowercase_task_prompts:
+            prompt = prompt.lower()
         cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
         prompt_tokens = self.prompt_tokenizer._tokenizer.encode(cleaned, add_bos=True)  # noqa: SLF001
         prompt_tokens += self.prompt_tokenizer._tokenizer.encode("\n")  # noqa: SLF001
@@ -415,7 +425,7 @@ class MemorySession:
         left = self.memory_horizon - len(memory)
         if left < 0:
             raise RuntimeError("Memory history exceeded the configured rolling horizon")
-        element = dict(message)
+        element = dict(message, prompt=prompt)
         element["memory_latents"] = np.pad(memory, ((left, 0), (0, 0)), constant_values=0)
         element["memory_mask"] = np.pad(mask, (left, 0), constant_values=False)
         if self.use_memory_segments:
@@ -514,21 +524,31 @@ def main() -> None:
     args = parse_args()
     if args.num_inference_steps <= 0 or args.pair_batch_size <= 0:
         raise ValueError("num-inference-steps and pair-batch-size must be positive")
-    if args.memory_lag != 10:
-        raise ValueError(f"This checkpoint family was trained with fixed memory lag 10, got {args.memory_lag}")
-    if args.config != DEFAULT_CONFIG:
-        raise ValueError(f"This release only supports config {DEFAULT_CONFIG!r}, got {args.config!r}")
     checkpoint = args.checkpoint.expanduser().resolve()
     _checkpoint_is_committed(checkpoint)
+    metadata = checkpoint / "musa.json"
+    saved = json.loads(metadata.read_text()) if metadata.is_file() else {}
+    args.config = args.config or saved.get("preset", DEFAULT_CONFIG)
+    if saved and saved["preset"] != args.config:
+        raise ValueError(f"Requested {args.config!r}, but this checkpoint records {saved['preset']!r}")
+    if args.config not in COMPATIBLE_CONFIGS:
+        raise ValueError(f"Unsupported DreamDojo config: {args.config!r}")
 
     from openpi.training import config as training_config
 
     config = training_config.get_config(args.config)
+    base_data = config.data.base_config
+    lag = base_data.memory_random_drop_execution_tail_min
+    if lag != base_data.memory_random_drop_execution_tail_max:
+        raise ValueError(f"{args.config} does not use a fixed training lag")
+    if args.memory_lag is not None and args.memory_lag != lag:
+        raise ValueError(f"{args.config} requires memory lag {lag}, got {args.memory_lag}")
+    args.memory_lag = lag
     if not config.model.use_memory:
         raise ValueError(f"Config {args.config} is not memory-enabled")
     expected_model_values = {
         "action_horizon": 50,
-        "memory_horizon": 1800,
+        "memory_horizon": 1410 if args.config == ORIGINAL_CONFIG else 1800,
         "memory_latent_dim": 64,
         "memory_prefix_order": "language_memory_vision",
         "memory_same_prefix_block": False,
@@ -541,8 +561,8 @@ def main() -> None:
     }
     if model_mismatches:
         raise ValueError(f"Config is not compatible with this standalone runtime: {model_mismatches}")
-    if config.policy_metadata.get("memory_random_drop_execution_tail") != "fixed_integer_10_per_sample":
-        raise ValueError("Config metadata does not declare fixed execution-tail lag 10")
+    if config.policy_metadata.get("memory_random_drop_execution_tail") != f"fixed_integer_{lag}_per_sample":
+        raise ValueError(f"Config metadata does not declare fixed execution-tail lag {lag}")
     if config.policy_metadata.get("memory_encoder_checkpoint_sha256") not in {
         identity[1] for identity in COMPATIBLE_ENCODER_IDENTITIES
     }:
@@ -553,6 +573,11 @@ def main() -> None:
             f"max-token-len must match the training value {training_max_token_len}, got {args.max_token_len}"
         )
     manifest, mean, std = _load_manifest(args.memory_manifest, config.model.memory_latent_dim)
+    if saved:
+        for name, value in (("mean", mean), ("std", std)):
+            recorded = saved["model"].get(f"memory_latent_{name}")
+            if recorded is not None and not np.allclose(recorded, value, rtol=1e-6, atol=1e-7):
+                raise ValueError(f"The memory manifest {name} differs from the training checkpoint")
     manifest_stride = int(manifest.get("transition_frame_stride", 1))
     transition_frame_stride = args.transition_frame_stride or manifest_stride
     if transition_frame_stride != manifest_stride or transition_frame_stride <= 0:
@@ -583,6 +608,11 @@ def main() -> None:
         explicit_sha256=None,
         verify_sha256=args.verify_dreamdojo_sha256,
     )
+    if args.config == ORIGINAL_CONFIG and (
+        manifest.get("checkpoint_sha256") != EXPECTED_ENCODER_SHA256
+        or encoder_identity.sha256 != EXPECTED_ENCODER_SHA256
+    ):
+        raise ValueError("The original DreamDojo preset requires the NVIDIA LAM 400k checkpoint and matching cache")
     encoder_key = (encoder_identity.format, encoder_identity.sha256)
     if encoder_key not in COMPATIBLE_ENCODER_IDENTITIES:
         raise ValueError(f"Unsupported DreamDojo encoder identity: {encoder_key}")
@@ -664,6 +694,7 @@ def main() -> None:
             two_view_memory=two_view_memory,
             memory_lag=args.memory_lag,
             latent_storage_dtype=str(manifest["latent_dtype"]),
+            lowercase_task_prompts=base_data.lowercase_task_prompts,
         )
 
     server = Server(session_factory=session_factory, host=args.host, port=args.port, metadata=metadata)

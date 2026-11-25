@@ -90,8 +90,8 @@ build_one_cache() {
       "${image_key}" "${world_size}" "${CACHE_GPUS}"
     for rank in "${!gpu_ids[@]}"; do
       gpu=${gpu_ids[rank]}
-      CUDA_VISIBLE_DEVICES=${gpu} "${PY}" "${common_args[@]}" \
-        --device cuda:0 --rank "${rank}" --world-size "${world_size}" &
+      CUDA_VISIBLE_DEVICES=${gpu} MUSA_VISIBLE_DEVICES=${gpu} "${PY}" "${common_args[@]}" \
+        --device "${DREAMDOJO_DEVICE:-cuda:0}" --rank "${rank}" --world-size "${world_size}" &
       pids+=("$!")
     done
     for rank in "${!pids[@]}"; do
@@ -156,7 +156,7 @@ compute_norm_stats() {
   export OPENPI_NORM_NUM_WORKERS=${OPENPI_NORM_NUM_WORKERS:-8}
   PYTHONPATH="${BUNDLE_ROOT}/src:${BUNDLE_ROOT}" JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= \
     "${PY}" "${BUNDLE_ROOT}/scripts/compute_norm_stats.py" \
-    --config-name pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default \
+    --config-name "${ROBOMME_TRAIN_CONFIG:-pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default}" \
     --output-dir "${ROBOMME_ASSETS_ROOT}/${ASSET_ID}"
 }
 

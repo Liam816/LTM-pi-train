@@ -411,8 +411,8 @@ def resolve_checkpoint_identity(
 def resolve_device(device_arg: str, local_rank_arg: int | None) -> str:
     import torch
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("DreamDojo LAM extraction requires CUDA; torch.cuda.is_available() is false")
+    if device_arg.partition(":")[0] == "musa":
+        import torch_musa  # noqa: F401  # Register the native device before parsing it.
     if device_arg != "auto":
         device = device_arg
     else:
@@ -421,15 +421,18 @@ def resolve_device(device_arg: str, local_rank_arg: int | None) -> str:
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
     parsed = torch.device(device)
-    if parsed.type != "cuda":
-        raise ValueError(f"only CUDA devices are supported, got {device!r}")
-    device_index = parsed.index if parsed.index is not None else torch.cuda.current_device()
-    if device_index >= torch.cuda.device_count():
-        raise ValueError(f"requested {device}, but only {torch.cuda.device_count()} CUDA devices are visible")
-    torch.cuda.set_device(device_index)
-    if not torch.cuda.is_bf16_supported():
+    if parsed.type not in {"cuda", "musa"}:
+        raise ValueError(f"expected a CUDA or MUSA device, got {device!r}")
+    backend = getattr(torch, parsed.type)
+    if not backend.is_available():
+        raise RuntimeError(f"{parsed.type} is unavailable")
+    device_index = parsed.index if parsed.index is not None else backend.current_device()
+    if device_index >= backend.device_count():
+        raise ValueError(f"requested {device}, but only {backend.device_count()} devices are visible")
+    backend.set_device(device_index)
+    if not backend.is_bf16_supported():
         raise RuntimeError(f"{device} does not report bfloat16 support")
-    return f"cuda:{device_index}"
+    return f"{parsed.type}:{device_index}"
 
 
 def load_dreamdojo_encoder(
@@ -775,7 +778,7 @@ def encode_causal_latents(
             pair_array = np.stack([lam_frames[source_batch], lam_frames[destination_batch]], axis=1)
             pair_tensor = torch.from_numpy(pair_array).to(device=device, dtype=torch.bfloat16)
             pair_tensor = pair_tensor / 255.0
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16):
                 encoded = encode_full(model, pair_tensor, sample=False, use_ckpt=False)
             z_mu = encoded["z_mu"].float()
             expected_shape = (len(destination_batch), LATENT_DIM)
@@ -1849,7 +1852,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Seed combined with episode_index to reproduce the shared crop across camera extractions.",
     )
-    extract.add_argument("--device", default="auto", help="CUDA device such as cuda:0; auto uses LOCAL_RANK.")
+    extract.add_argument("--device", default="auto", help="cuda:0 or musa:0. Auto selects CUDA at LOCAL_RANK.")
     extract.add_argument("--rank", type=int, default=None, help="Shard rank; default reads RANK, then 0.")
     extract.add_argument("--world-size", type=int, default=None, help="Shard count; default reads WORLD_SIZE, then 1.")
     extract.add_argument("--local-rank", type=int, default=None, help=argparse.SUPPRESS)

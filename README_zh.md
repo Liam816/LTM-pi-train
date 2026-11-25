@@ -2,13 +2,27 @@
 
 [English](README.md) | 简体中文
 
-面向 RoboMME 长时序操作任务的 PI0.5 训练与在线推理实现。默认实验使用
+面向 RoboMME 长时序操作任务的 PI0.5 训练与在线推理实现。上游发布脚本的默认实验使用
 RoboMME-10x 10 FPS H.264 video 数据、DreamDojo LAM 400k 双视角 memory，并在训练和
 推理时固定隐藏最新 10 个 execution memory token。
 
 仓库包含训练、cache 生成、norm stats 计算和 WebSocket 推理所需源码；DreamDojo
 LAM 的最小运行时代码已经放在 `third_party/dreamdojo/`，不需要额外 clone
 DreamDojo 或 CD-LAM 仓库。数据和模型权重不随源码发布。
+
+## 论文表 1 的原版 RoboMME（MUSA）
+
+[八卡 Python 配置](configs/train/robomme_1x_musa_8gpu.py) 使用原版 16 个任务、每任务 100 条轨迹和 DreamDojo 双视角记忆。全局 batch 为 128，优化器更新 40,000 次，学习率在 1,000 步 warm-up 后从 2.5e-5 衰减至 2.5e-6。训练与推理固定 lag 5，预测 50 步动作，每 10 步重新规划。对应论文表 1 的平均成功率为 58.54%。
+
+`ROBOMME_1X_RESOURCE_ROOT` 下的 `datasets/video`、`artifacts/memory`、`artifacts/anchors` 和 `assets/lerobot/robomme` 应来自同一份原版训练数据。可以用 `scripts/repack_robomme_v3.py SOURCE DESTINATION` 转换原版 LeRobot v3 导出，再用本仓库的 `bin/prepare.sh` 生成两路缓存、锚点及归一化。MUSA 缓存提取使用 `DREAMDOJO_DEVICE=musa:0` 和 `CACHE_GPUS=0,1,2,3,4,5,6,7`。已准备好数据时，在仓库根目录运行以下命令。
+
+```bash
+cfg=configs/train/robomme_1x_musa_8gpu.py
+bin/train.sh preflight --cfg "$cfg"
+bin/train.sh benchmark --cfg "$cfg" --steps 12
+```
+
+在机器的 `.env` 中设置 `ROBOMME_DEFAULT_CFG=configs/train/robomme_1x_musa_8gpu.py` 后，`bin/train.sh` 会选择原版配置。正式训练使用 `run --cfg "$cfg"`。评测导出的 MUSA checkpoint 时，服务端从 checkpoint 读取训练 preset 和 lag。表 1 每个任务做 50 次 rollout，报告 3 个评测随机种子的平均成功率。
 
 ## 环境
 

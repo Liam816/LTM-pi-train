@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -95,10 +96,19 @@ def _read_cfg(cfg_path: Path, *, implicit: bool, smoke: bool = False) -> dict:
 
     runtime = _section(config, "runtime", {
         "python_bin", "run_base_dir", "tmux_session", "hf_cache_dir", "env", "device_backend", "activation_checkpointing",
+        "sample_effective_batch", "defer_gradient_sync", "activation_checkpoint_blocks",
     })
     backend = runtime.get("device_backend", "jax")
     if backend not in ("jax", "musa"):
         raise ValueError("runtime.device_backend must be jax or musa")
+    for key in ("activation_checkpointing", "sample_effective_batch", "defer_gradient_sync"):
+        if key in runtime and type(runtime[key]) is not bool:
+            raise ValueError(f"runtime.{key} must be a boolean")
+    blocks = runtime.get("activation_checkpoint_blocks")
+    if blocks is not None:
+        if (not isinstance(blocks, list) or any(type(i) is not int or i < 0 for i in blocks)
+                or len(set(blocks)) != len(blocks) or not runtime.get("activation_checkpointing", True)):
+            raise ValueError("runtime.activation_checkpoint_blocks requires checkpointing and unique nonnegative indices")
     if smoke:
         if backend != "musa":
             raise ValueError("The bounded smoke action requires a MUSA configuration")
@@ -170,6 +180,9 @@ def _read_cfg(cfg_path: Path, *, implicit: bool, smoke: bool = False) -> dict:
     return {
         "device_backend": backend, "activation_checkpointing": runtime.get("activation_checkpointing", True),
         "smoke": smoke,
+        "activation_checkpoint_blocks": blocks,
+        "sample_effective_batch": runtime.get("sample_effective_batch", False),
+        "defer_gradient_sync": runtime.get("defer_gradient_sync", False),
         "preset": config["preset"],
         "paths": paths,
         "train": train,
@@ -184,7 +197,30 @@ def _read_cfg(cfg_path: Path, *, implicit: bool, smoke: bool = False) -> dict:
     }
 
 
-def _preflight(plan: dict) -> dict:
+def _check_original_data(info_path, memory, anchors, normalizer, *, bounded):
+    info = json.loads(info_path.read_text())
+    full = (info["total_episodes"], info["total_frames"]) == (1600, 768897)
+    source = info_path.with_name("source.json")
+    if not full and (not bounded or not source.is_file()):
+        raise ValueError("The Table 1 preset requires the original 1,600-episode RoboMME training split")
+    if (memory.get("checkpoint_sha256") != "d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f"
+            or memory.get("cached_valid_transitions") != info["total_frames"] - info["total_episodes"]):
+        raise ValueError("Expected a complete DreamDojo LAM 400k cache for this original-data export")
+    hashes = {name: hashlib.sha256(file.read_bytes()).hexdigest() for name, file in
+              (("dataset_info_sha256", info_path), ("dataset_episodes_sha256", info_path.with_name("episodes.jsonl")))}
+    for manifest in (memory, anchors):
+        if any(manifest.get(name) != digest for name, digest in hashes.items()):
+            raise ValueError("Memory and anchor caches must match the selected RoboMME dataset metadata")
+    stats = json.loads(normalizer.with_name("manifest.json").read_text())
+    if (stats.get("total_frames"), stats.get("execution_frames"), stats.get("action_horizon")) != (768897, 476857, 50):
+        raise ValueError("Expected state/action normalization over the original RoboMME execution queries")
+    expected_info = hashes["dataset_info_sha256"] if full else json.loads(source.read_text())["dataset_info_sha256"]
+    if (stats.get("dataset_info_sha256") != expected_info
+            or (full and stats.get("dataset_episodes_sha256") != hashes["dataset_episodes_sha256"])):
+        raise ValueError("The original-data normalization manifest does not match the source dataset")
+
+
+def _preflight(plan: dict, *, bounded: bool = False) -> dict:
     if shutil.which(plan["python"]) is None:
         raise ValueError(f"Python not found: {plan['python']}")
     paths = plan["paths"]
@@ -199,7 +235,10 @@ def _preflight(plan: dict) -> dict:
     for path in (dataset_info, memory_manifest, anchor_manifest, normalizer):
         if not path.is_file():
             raise ValueError(f"Required input file not found: {path}")
-    stats = json.loads(memory_manifest.read_text(encoding="utf-8"))["latent_normalization"]
+    memory = json.loads(memory_manifest.read_text(encoding="utf-8"))
+    if plan["preset"] == "pi05_robomme_1x_dreamdojo_fixedlag5_h50":
+        _check_original_data(dataset_info, memory, json.loads(anchor_manifest.read_text()), normalizer, bounded=bounded)
+    stats = memory["latent_normalization"]
     dimension = plan["model"].get("memory_latent_dim", len(stats["mean"]))
     for key in ("mean", "std"):
         values = stats[key]
@@ -275,12 +314,33 @@ def main(argv: list[str]) -> None:
         return
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", default="launch", choices=("show", "preflight", "run", "launch", "status", "smoke"))
-    parser.add_argument("--cfg", type=Path, help=f"Python training configuration, defaults to {DEFAULT_CFG.relative_to(ROOT)}")
+    parser.add_argument("action", nargs="?", default="launch", choices=("show", "preflight", "run", "launch", "status", "smoke", "benchmark"))
+    parser.add_argument("--cfg", type=Path, default=os.environ.get("ROBOMME_DEFAULT_CFG"),
+                        help=f"Python config. Defaults to ROBOMME_DEFAULT_CFG or {DEFAULT_CFG.relative_to(ROOT)}.")
+    parser.add_argument("--steps", type=int, help="Total complete optimizer updates for the benchmark action (1–24)")
+    parser.add_argument("--batch-offset", type=int, help="Start the benchmark at this loader batch in epoch zero")
     args = parser.parse_args(argv)
-    cfg_path = args.cfg.expanduser().resolve() if args.cfg is not None else None
+    cfg_path = _repo_path(args.cfg).resolve() if args.cfg is not None else None
     try:
         plan = _read_cfg(cfg_path or DEFAULT_CFG, implicit=cfg_path is None, smoke=args.action == "smoke")
+        if args.action != "benchmark" and (args.steps is not None or args.batch_offset is not None):
+            raise ValueError("--steps and --batch-offset require the benchmark action")
+        if args.action == "benchmark":
+            if plan["device_backend"] != "musa":
+                raise ValueError("The benchmark action requires a MUSA configuration")
+            steps = 5 if args.steps is None else args.steps
+            offset = 0 if args.batch_offset is None else args.batch_offset
+            if not 1 <= steps <= 24 or offset < 0:
+                raise ValueError("benchmark requires 1–24 updates and a nonnegative batch offset")
+            if plan["train"].get("resume") or plan["train"].get("restore_checkpoint_dir"):
+                raise ValueError("benchmark requires a fresh configuration")
+            directory = Path(plan["log"]).parents[1] / "benchmark"
+            directory.mkdir(parents=True, exist_ok=True)
+            run_dir = Path(tempfile.mkdtemp(prefix=plan["train"]["exp_name"] + "-", dir=directory))
+            plan["train"].update(num_train_steps=steps, log_interval=1, save_steps=[steps], overwrite=False,
+                                 checkpoint_base_dir=str(run_dir), wandb_enabled=False)
+            plan["log"] = str(run_dir / "train.log")
+            print(f"MUSA benchmark output: {run_dir}", flush=True)
         if args.action == "show":
             visible_env = {
                 key: value for key, value in plan["environment"].items()
@@ -296,8 +356,8 @@ def main(argv: list[str]) -> None:
             _launch(plan, cfg_path)
         elif args.action == "status":
             _status(plan)
-        elif args.action in ("run", "smoke"):
-            stats = _preflight(plan)
+        elif args.action in ("run", "smoke", "benchmark"):
+            stats = _preflight(plan, bounded=args.action in ("smoke", "benchmark"))
             training_keys = ("preset", "paths", "train", "model", "data", "optimizer", "lr_schedule")
             training_plan = {key: plan[key] for key in training_keys}
             training_plan["model"] = plan["model"] | stats
@@ -310,6 +370,10 @@ def main(argv: list[str]) -> None:
                     plan["log"] = str(run_dir / "train.log")
                     print(f"MUSA smoke output: {run_dir}", flush=True)
                 training_plan.update(smoke=plan["smoke"], activation_checkpointing=plan["activation_checkpointing"])
+                if args.action == "benchmark":
+                    training_plan["benchmark"] = {"batch_offset": offset}
+                for key in ("sample_effective_batch", "defer_gradient_sync", "activation_checkpoint_blocks"):
+                    training_plan[key] = plan[key]
                 world = len(plan["environment"]["MUSA_VISIBLE_DEVICES"].split(","))
                 command = [plan["python"]]
                 if world > 1:

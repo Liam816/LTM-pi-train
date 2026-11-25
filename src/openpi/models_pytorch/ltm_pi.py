@@ -12,7 +12,7 @@ from transformers.models.gemma.modeling_gemma import _gated_residual
 from openpi.models import gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 from openpi.models_pytorch.pi0_pytorch import create_sinusoidal_pos_embedding, make_att_2d_masks
-from openpi.models_pytorch.preprocessing_pytorch import preprocess_observation_pytorch
+from openpi.models_pytorch.preprocessing_pytorch import SimpleProcessedObservation, preprocess_observation_pytorch
 
 
 def _rotate(x, positions):
@@ -75,8 +75,16 @@ def insert_block(tokens, valid, block, block_mask, index):
     )
 
 
+def prepare_flow_inputs(observation, actions, image_keys, train):
+    """Draw the image augmentations and flow targets for one rank-local sampler batch."""
+    obs = preprocess_observation_pytorch(observation, train=train, image_keys=image_keys)
+    # Inverse CDF for Beta(1.5,1), avoiding a device-specific gamma sampler.
+    time = torch.rand(actions.shape[0], device=actions.device).pow(1 / 1.5).mul_(0.999).add_(0.001)
+    return vars(obs), (time, torch.randn_like(actions))
+
+
 class LTMPolicy(nn.Module):
-    def __init__(self, cfg, *, activation_checkpointing=True):
+    def __init__(self, cfg, *, activation_checkpointing=True, activation_checkpoint_blocks=None):
         super().__init__()
         if not (
             cfg.pi05
@@ -120,6 +128,10 @@ class LTMPolicy(nn.Module):
         self.blocks = nn.ModuleList(
             JointBlock(v, a, vlm.head_dim) for v, a in zip(language.layers, action.layers, strict=True)
         )
+        self.checkpoint_blocks = frozenset(range(len(self.blocks)) if activation_checkpoint_blocks is None
+                                           else activation_checkpoint_blocks)
+        if not self.checkpoint_blocks.issubset(range(len(self.blocks))):
+            raise ValueError("activation_checkpoint_blocks contains an index outside the joint backbone")
         self.vlm_norm, self.action_norm = language.norm, action.norm
         self.action_in_proj = nn.Linear(cfg.action_dim, expert.width)
         self.action_out_proj = nn.Linear(expert.width, cfg.action_dim)
@@ -171,12 +183,12 @@ class LTMPolicy(nn.Module):
         boundaries = torch.cat((torch.ones_like(masks[0]), demo_ar, (local <= 0) | (local >= patches), current_ar), 1)
         return torch.cat((words, demo, tokens, current), 1), torch.cat(masks, 1), boundaries
 
-    def forward(self, observation, actions):
-        obs = preprocess_observation_pytorch(observation, train=self.training, image_keys=self.cfg.active_image_keys)
+    def forward(self, observation, actions, flow=None):
         device = actions.device
-        # Inverse CDF for Beta(1.5,1), avoiding a device-specific gamma sampler.
-        time = torch.rand(actions.shape[0], device=device).pow(1 / 1.5).mul_(0.999).add_(0.001)
-        noise = torch.randn_like(actions)
+        if flow is None:
+            observation, flow = prepare_flow_inputs(observation, actions, self.cfg.active_image_keys, self.training)
+        obs = SimpleProcessedObservation(**observation)
+        time, noise = flow
         noisy = time[:, None, None] * noise + (1 - time[:, None, None]) * actions
         time_embedding = create_sinusoidal_pos_embedding(time, self.time_mlp_in.in_features, 4e-3, 4.0, device).float()
         cond = F.silu(self.time_mlp_out(F.silu(self.time_mlp_in(time_embedding))))
@@ -191,9 +203,9 @@ class LTMPolicy(nn.Module):
             # Moore Threads SDPA needs one finite key even for padding queries.
             mask[..., 0] |= ~valid[:, None, :]
             positions = valid.long().cumsum(1) - 1
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
                 args = (prefix, suffix, positions, mask, valid, cond)
-                if self.training and self.activation_checkpointing:
+                if self.training and self.activation_checkpointing and block_index in self.checkpoint_blocks:
                     prefix, suffix = checkpoint(block, *args, use_reentrant=False, preserve_rng_state=False)
                 else:
                     prefix, suffix = block(*args)
